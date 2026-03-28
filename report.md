@@ -67,42 +67,45 @@
 - `422`, если отсутствует обязательная фича;
 - `500`, если инференс падает;
 - `400` для невалидного `run_id` в обновлении модели;
-- проверка, что `/metrics` отдает текст Prometheus-формата.
+- проверка, что `/metrics` возвращает конфигурацию Graphite backend.
 
 4. E2E (`tests/test_service_e2e.py`):
 - сервис поднимается через `TestClient`;
 - `/health` доступен;
 - `/predict` возвращает предсказание.
 
-## 3. Логирование метрик (Prometheus)
+## 3. Логирование метрик (Graphite)
 
-Реализован хэндлер `GET /metrics`.
+Метрики отправляются в Graphite через StatsD.
+
+Хэндлер `GET /metrics` возвращает служебную информацию о backend и параметрах подключения StatsD.
 
 Логируются:
 
 1. Технические метрики сервиса:
-- `service_requests_total` (число запросов);
-- `service_request_latency_seconds` (время ответа, histogram);
-- `service_errors_total` (статистика ошибок по кодам);
-- `service_process_memory_bytes` (RSS память);
-- `service_process_cpu_percent` (CPU процесса).
+- `ml_service.http.requests_total.<method>.<path>.<status_code>` (число запросов);
+- `ml_service.http.response_time_ms.<method>.<path>` (время ответа);
+- `ml_service.http.errors_total.<path>.<status_code>` (статистика ошибок);
+- `ml_service.system.process.memory_bytes` (RSS память);
+- `ml_service.system.process.cpu_percent` (CPU процесса).
 
 2. Метрики входных данных:
-- `service_preprocessing_seconds` (время предобработки, histogram);
-- `feature_numeric_value` (распределение числовых фич);
-- `feature_categorical_total` (распределение категориальных фич).
+- `ml_service.data.preprocessing_ms` (время предобработки);
+- `ml_service.features.numeric.<feature>.value` (значения числовых фич);
+- `ml_service.features.categorical.<feature>.<value>.total` (распределение категориальных фич).
 
 3. Метрики модели:
-- `service_inference_seconds` (время инференса, histogram);
-- `model_probability` (распределение вероятностей);
-- `model_predictions_total` (распределение классов предсказаний).
+- `ml_service.model.inference_ms` (время инференса);
+- `ml_service.model.probability` (распределение вероятностей);
+- `ml_service.model.predictions.<class>.total` (распределение классов предсказаний).
 
 4. События и состояние прод-модели:
-- `model_updates_total` (успешные/неуспешные обновления);
-- `model_info` (run_id и тип активной модели);
-- `model_required_features` (фичи активной модели).
+- `ml_service.model.update.<status>.total` (успешные/неуспешные обновления);
+- `ml_service.model.active.type` (тип активной модели, StatsD set);
+- `ml_service.model.active.run_id` (run_id активной модели, StatsD set);
+- `ml_service.model.active.required_feature` и `ml_service.model.active.required_features.count` (фичи активной модели).
 
-Перцентили 75%, 90%, 95%, 99%, 99.9% считаются в Prometheus/Grafana из histogram через `histogram_quantile`.
+Перцентили 75%, 90%, 95%, 99%, 99.9% считаются StatsD/Graphite для таймеров (`response_time_ms`, `preprocessing_ms`, `inference_ms`). Для этого в `statsd/config.js` задан `percentThreshold: [75, 90, 95, 99, 99.9]`.
 
 ## 4. Мониторинг дрифта (Evidently)
 
@@ -147,6 +150,3 @@
 - приложить ссылку на Grafana-дашборд(ы);
 - если используете Telegram, приложить invite-ссылку на чат.
 
-## 6. Важное примечание
-
-Тесты в этой итерации намеренно не запускались по вашему требованию.

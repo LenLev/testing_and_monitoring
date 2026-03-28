@@ -93,10 +93,11 @@ def test_update_model_returns_400_for_invalid_run_id(monkeypatch):
     assert 'Unable to load model' in resp.json()['detail']
 
 
-def test_metrics_endpoint_exposes_prometheus_text():
+def test_metrics_endpoint_exposes_graphite_backend_info():
     client = TestClient(app_module.create_app())
 
     resp = client.get('/metrics')
 
     assert resp.status_code == 200
-    assert 'service_requests_total' in resp.text
+    body = resp.json()
+    assert body['backend'] == 'graphite'

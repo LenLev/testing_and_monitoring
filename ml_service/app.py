@@ -4,17 +4,16 @@ import time
 from typing import Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
 
 from ml_service import config
 from ml_service.drift import run_drift_reporter, track_for_drift
 from ml_service.features import request_to_feature_dict, to_dataframe
 from ml_service.metrics import (
-    INFERENCE_SECONDS,
-    PREPROCESSING_SECONDS,
-    metrics_response,
+    metrics_backend_info,
+    observe_inference_duration,
     observe_feature_values,
     observe_model_update,
+    observe_preprocessing_duration,
     observe_prediction,
     refresh_resource_metrics,
     track_http_metrics,
@@ -76,12 +75,20 @@ def create_app() -> FastAPI:
         run_id = model_state.run_id
         model_loaded = model_state.model is not None
         refresh_resource_metrics()
-        return {'status': 'ok', 'run_id': run_id, 'model_loaded': model_loaded}
+        return {
+            'status': 'ok',
+            'run_id': run_id,
+            'model_loaded': model_loaded,
+            'metrics_backend': 'graphite',
+        }
 
     @app.get('/metrics')
-    def metrics() -> Response:
-        payload, content_type = metrics_response()
-        return Response(content=payload, media_type=content_type)
+    def metrics() -> dict[str, Any]:
+        return {
+            'status': 'ok',
+            'message': 'Graphite backend is enabled. Metrics are emitted via StatsD.',
+            **metrics_backend_info(),
+        }
 
     @app.post('/predict', response_model=PredictResponse)
     def predict(request: PredictRequest) -> PredictResponse:
@@ -101,7 +108,7 @@ def create_app() -> FastAPI:
             LOGGER.exception('Unexpected preprocessing error')
             raise HTTPException(status_code=500, detail='Preprocessing failed') from exc
         finally:
-            PREPROCESSING_SECONDS.observe(time.perf_counter() - preprocess_started)
+            observe_preprocessing_duration(time.perf_counter() - preprocess_started)
 
         infer_started = time.perf_counter()
         try:
@@ -110,7 +117,7 @@ def create_app() -> FastAPI:
             LOGGER.exception('Inference failed')
             raise HTTPException(status_code=500, detail='Inference failed') from exc
         finally:
-            INFERENCE_SECONDS.observe(time.perf_counter() - infer_started)
+            observe_inference_duration(time.perf_counter() - infer_started)
 
         prediction = int(probability >= 0.5)
         observe_prediction(probability=probability, prediction=prediction)

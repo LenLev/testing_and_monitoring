@@ -1,113 +1,93 @@
+import importlib
+import logging
+import os
+import re
 import time
-from typing import Mapping
+from typing import Any, Mapping
 
 from fastapi import Request
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
-    Counter,
-    Gauge,
-    Histogram,
-    Info,
-    generate_latest,
-)
 
 try:
     import psutil
 except ImportError:  # pragma: no cover - optional dependency at runtime
     psutil = None
 
-
-REQUESTS_TOTAL = Counter(
-    'service_requests_total',
-    'Total number of incoming HTTP requests',
-    ['method', 'path', 'status_code'],
-)
-REQUEST_LATENCY_SECONDS = Histogram(
-    'service_request_latency_seconds',
-    'End-to-end request latency in seconds',
-    ['method', 'path'],
-    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0),
-)
-ERRORS_TOTAL = Counter(
-    'service_errors_total',
-    'Total number of service errors by status code',
-    ['path', 'status_code'],
-)
-
-PREPROCESSING_SECONDS = Histogram(
-    'service_preprocessing_seconds',
-    'Data preprocessing time in seconds',
-    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1),
-)
-INFERENCE_SECONDS = Histogram(
-    'service_inference_seconds',
-    'Model inference time in seconds',
-    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2),
-)
-MODEL_PROBABILITY = Histogram(
-    'model_probability',
-    'Predicted probability for positive class',
-    buckets=(0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0),
-)
-MODEL_PREDICTIONS_TOTAL = Counter(
-    'model_predictions_total',
-    'Predicted classes distribution',
-    ['prediction'],
-)
-
-FEATURE_NUMERIC = Histogram(
-    'feature_numeric_value',
-    'Distribution of numeric feature values',
-    ['feature'],
-    buckets=(
-        -1_000_000,
-        -100_000,
-        -10_000,
-        -1000,
-        -100,
-        -10,
-        0,
-        1,
-        10,
-        100,
-        1000,
-        10_000,
-        100_000,
-        1_000_000,
-    ),
-)
-FEATURE_CATEGORICAL_TOTAL = Counter(
-    'feature_categorical_total',
-    'Distribution of categorical feature values',
-    ['feature', 'value'],
-)
-
-PROCESS_MEMORY_BYTES = Gauge(
-    'service_process_memory_bytes',
-    'Resident memory size in bytes',
-)
-PROCESS_CPU_PERCENT = Gauge(
-    'service_process_cpu_percent',
-    'CPU usage percent of the process',
-)
-
-MODEL_UPDATES_TOTAL = Counter(
-    'model_updates_total',
-    'Number of model update attempts',
-    ['status'],
-)
-MODEL_INFO = Info(
-    'model_info',
-    'Active model information',
-)
-MODEL_REQUIRED_FEATURES = Info(
-    'model_required_features',
-    'Required features for currently active model',
-)
+LOGGER = logging.getLogger(__name__)
 
 
-def metrics_response() -> tuple[bytes, str]:
-    return generate_latest(), CONTENT_TYPE_LATEST
+def _sanitize(part: str) -> str:
+    normalized = re.sub(r'[^a-zA-Z0-9_]+', '_', str(part))
+    return normalized.strip('_').lower() or 'unknown'
+
+
+_STATSD_HOST = os.getenv('STATSD_HOST', 'graphite')
+_STATSD_PORT = int(os.getenv('STATSD_PORT', '8125'))
+_STATSD_PREFIX = os.getenv('STATSD_PREFIX', 'ml_service')
+
+try:
+    statsd_module = importlib.import_module('statsd')
+    StatsClient = getattr(statsd_module, 'StatsClient', None)
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    StatsClient = None
+
+
+class _NoopStatsClient:
+    def incr(self, _metric: str, count: int = 1) -> None:
+        _ = count
+
+    def gauge(self, _metric: str, value: float) -> None:
+        _ = value
+
+    def timing(self, _metric: str, value: int) -> None:
+        _ = value
+
+    def set(self, _metric: str, value: str) -> None:
+        _ = value
+
+
+if StatsClient is None:
+    LOGGER.warning('statsd package is not installed, metric emission is disabled')
+    _CLIENT: Any = _NoopStatsClient()
+else:
+    _CLIENT = StatsClient(host=_STATSD_HOST, port=_STATSD_PORT, prefix=_STATSD_PREFIX)
+
+
+def metrics_backend_info() -> dict[str, str | int]:
+    return {
+        'backend': 'graphite',
+        'statsd_host': _STATSD_HOST,
+        'statsd_port': _STATSD_PORT,
+        'statsd_prefix': _STATSD_PREFIX,
+    }
+
+
+def _incr(metric: str, count: int = 1) -> None:
+    try:
+        _CLIENT.incr(metric, count=count)
+    except Exception:
+        LOGGER.exception('Failed to send counter metric: %s', metric)
+
+
+def _gauge(metric: str, value: float) -> None:
+    try:
+        _CLIENT.gauge(metric, value)
+    except Exception:
+        LOGGER.exception('Failed to send gauge metric: %s', metric)
+
+
+def _timing_ms(metric: str, seconds: float) -> None:
+    milliseconds = max(int(seconds * 1000), 0)
+    try:
+        _CLIENT.timing(metric, milliseconds)
+    except Exception:
+        LOGGER.exception('Failed to send timing metric: %s', metric)
+
+
+def _set(metric: str, value: str) -> None:
+    try:
+        _CLIENT.set(metric, value)
+    except Exception:
+        LOGGER.exception('Failed to send set metric: %s', metric)
 
 
 def observe_feature_values(feature_values: Mapping[str, object]) -> None:
@@ -115,15 +95,26 @@ def observe_feature_values(feature_values: Mapping[str, object]) -> None:
         if value is None:
             continue
 
+        feature_name = _sanitize(feature)
+
         if isinstance(value, (int, float)):
-            FEATURE_NUMERIC.labels(feature=feature).observe(float(value))
+            _gauge(f'features.numeric.{feature_name}.value', float(value))
         else:
-            FEATURE_CATEGORICAL_TOTAL.labels(feature=feature, value=str(value)).inc()
+            category = _sanitize(str(value))
+            _incr(f'features.categorical.{feature_name}.{category}.total')
+
+
+def observe_preprocessing_duration(seconds: float) -> None:
+    _timing_ms('data.preprocessing_ms', seconds)
+
+
+def observe_inference_duration(seconds: float) -> None:
+    _timing_ms('model.inference_ms', seconds)
 
 
 def observe_prediction(probability: float, prediction: int) -> None:
-    MODEL_PROBABILITY.observe(probability)
-    MODEL_PREDICTIONS_TOTAL.labels(prediction=str(prediction)).inc()
+    _gauge('model.probability', probability)
+    _incr(f'model.predictions.{_sanitize(str(prediction))}.total')
 
 
 def observe_model_update(
@@ -132,44 +123,50 @@ def observe_model_update(
     features: list[str] | None = None,
     model_type: str | None = None,
 ) -> None:
-    MODEL_UPDATES_TOTAL.labels(status=status).inc()
+    _incr(f'model.update.{_sanitize(status)}.total')
 
     if status == 'success':
-        MODEL_INFO.info({'run_id': run_id, 'model_type': model_type or 'unknown'})
-        MODEL_REQUIRED_FEATURES.info({'features': ','.join(features or [])})
+        _set('model.active.run_id', run_id)
+        _set('model.active.type', model_type or 'unknown')
+        _gauge('model.active.required_features.count', float(len(features or [])))
+        for feature in features or []:
+            _set('model.active.required_feature', feature)
 
 
 def refresh_resource_metrics() -> None:
     if psutil is None:
         return
 
-    process = psutil.Process()
-    PROCESS_MEMORY_BYTES.set(process.memory_info().rss)
-    PROCESS_CPU_PERCENT.set(process.cpu_percent(interval=None))
+    try:
+        process = psutil.Process()
+        _gauge('system.process.memory_bytes', float(process.memory_info().rss))
+        _gauge('system.process.cpu_percent', float(process.cpu_percent(interval=None)))
+    except Exception:
+        LOGGER.exception('Failed to collect process resource metrics')
 
 
 async def track_http_metrics(request: Request, call_next):
     started = time.perf_counter()
-    path = request.url.path
-    method = request.method
+    path = _sanitize(request.url.path)
+    method = _sanitize(request.method)
 
     try:
         response = await call_next(request)
     except Exception:
         elapsed = time.perf_counter() - started
-        REQUEST_LATENCY_SECONDS.labels(method=method, path=path).observe(elapsed)
-        REQUESTS_TOTAL.labels(method=method, path=path, status_code='500').inc()
-        ERRORS_TOTAL.labels(path=path, status_code='500').inc()
+        _timing_ms(f'http.response_time_ms.{method}.{path}', elapsed)
+        _incr(f'http.requests_total.{method}.{path}.500')
+        _incr(f'http.errors_total.{path}.500')
         refresh_resource_metrics()
         raise
 
     elapsed = time.perf_counter() - started
-    status_code = str(response.status_code)
-    REQUEST_LATENCY_SECONDS.labels(method=method, path=path).observe(elapsed)
-    REQUESTS_TOTAL.labels(method=method, path=path, status_code=status_code).inc()
+    status_code = _sanitize(str(response.status_code))
+    _timing_ms(f'http.response_time_ms.{method}.{path}', elapsed)
+    _incr(f'http.requests_total.{method}.{path}.{status_code}')
 
     if response.status_code >= 400:
-        ERRORS_TOTAL.labels(path=path, status_code=status_code).inc()
+        _incr(f'http.errors_total.{path}.{status_code}')
 
     refresh_resource_metrics()
     return response
