@@ -63,7 +63,7 @@ class PredictResponse(BaseModel):
 
 
 class UpdateModelRequest(BaseModel):
-    run_id: str = Field(description='MLflow run_id')
+    run_id: str = Field(min_length=1, description='MLflow run_id')
 
 
 class UpdateModelResponse(BaseModel):

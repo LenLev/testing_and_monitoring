@@ -31,4 +31,7 @@ class Model:
 
     @property
     def features(self) -> list[str]:
-        return self.data.model.feature_names_in_
+        model_data = self.get()
+        if model_data.model is None:
+            return []
+        return list(model_data.model.feature_names_in_)
